@@ -1,7 +1,8 @@
 """
 Fantasy Lineup Optimizer — Python/PuLP solver server
-Parallel ILP: solves lineups in batches using ThreadPoolExecutor.
-Each thread runs its own CBC instance simultaneously.
+Strategy: solve first batch of MAX_WORKERS lineups in parallel,
+then fill remaining slots sequentially (each sees all prior exclusions).
+This gets the speed benefit of parallelism while guaranteeing 20 unique lineups.
 """
 
 from flask import Flask, request, jsonify
@@ -14,16 +15,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 app = Flask(__name__)
 CORS(app)
 
-# Number of parallel CBC solvers — Railway gives 1-2 vCPUs, 4 threads is safe
 MAX_WORKERS = 4
 
 
 def build_and_solve(players, cap, size, pos_c, team_c, excl_sets, unique_by_name, round_i):
-    """
-    Build and solve a single lineup ILP.
-    excl_sets: list of sets (names or uids) from already-found lineups to exclude.
-    Returns (lineup, elapsed_ms) or (None, elapsed_ms).
-    """
+    """Build and solve a single lineup ILP. Returns (lineup, elapsed_ms)."""
     name_to_players = {}
     for p in players:
         name_to_players.setdefault(p["name"], []).append(p)
@@ -33,20 +29,13 @@ def build_and_solve(players, cap, size, pos_c, team_c, excl_sets, unique_by_name
     x = {p["uid"]: pulp.LpVariable(f"x_{round_i}_{i}", cat="Binary")
          for i, p in enumerate(players)}
 
-    # Objective
     prob += pulp.lpSum(p["pts"] * x[p["uid"]] for p in players)
-
-    # Salary cap
     prob += pulp.lpSum(p["salary"] * x[p["uid"]] for p in players) <= cap
-
-    # Roster size
     prob += pulp.lpSum(x[p["uid"]] for p in players) == size
 
-    # Position minimums
     for pos, req in pos_c.items():
         prob += pulp.lpSum(x[p["uid"]] for p in players if p["pos"] == pos) >= req
 
-    # Team constraints
     for team, tc in team_c.items():
         expr = pulp.lpSum(x[p["uid"]] for p in players if p["team"] == team)
         mode, val = tc["mode"], tc["val"]
@@ -57,12 +46,10 @@ def build_and_solve(players, cap, size, pos_c, team_c, excl_sets, unique_by_name
         elif mode == "max":
             prob += expr <= val
 
-    # Same player in multiple positions -> pick at most 1
     for name, dupes in name_to_players.items():
         if len(dupes) > 1:
             prob += pulp.lpSum(x[p["uid"]] for p in dupes) <= 1
 
-    # Exclusion constraints
     for excl in excl_sets:
         if unique_by_name:
             terms = []
@@ -81,101 +68,104 @@ def build_and_solve(players, cap, size, pos_c, team_c, excl_sets, unique_by_name
     prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=10))
     elapsed = round((time.time() - t1) * 1000)
 
-    status = pulp.LpStatus[prob.status]
-    if status != "Optimal":
+    if pulp.LpStatus[prob.status] != "Optimal":
         return None, elapsed
 
     lineup = [p for p in players
               if pulp.value(x[p["uid"]]) is not None
               and pulp.value(x[p["uid"]]) > 0.5]
 
-    if len(lineup) != size:
-        return None, elapsed
+    return (lineup if len(lineup) == size else None), elapsed
 
-    return lineup, elapsed
+
+def lineup_key(lineup, unique_by_name):
+    if unique_by_name:
+        return frozenset(p["name"] for p in lineup)
+    return frozenset(p["uid"] for p in lineup)
 
 
 def solve_lineups(players, cap, size, pos_c, team_c, n_lineups, unique_by_name=False):
-    """
-    Solve N lineups in parallel batches.
-    Batch size = MAX_WORKERS. Each batch uses exclusions from all confirmed
-    lineups found so far. Within a batch, lineups are solved simultaneously.
-    """
-    results  = []
-    timings  = []
-    excl_sets = []
+    results   = []
+    timings   = []
+    seen_keys = set()
+    excl_sets = []  # grows as unique lineups are confirmed
 
-    batch_size = MAX_WORKERS
+    round_i = 0
 
-    i = 0
-    while i < n_lineups:
-        # How many to solve in this batch
-        batch_count = min(batch_size, n_lineups - i)
+    while len(results) < n_lineups:
+        remaining = n_lineups - len(results)
 
-        # Each lineup in the batch excludes all confirmed results so far
-        # (lineups within the same batch may overlap — we deduplicate after)
-        futures = {}
-        with ThreadPoolExecutor(max_workers=batch_count) as executor:
-            for b in range(batch_count):
-                future = executor.submit(
-                    build_and_solve,
-                    players, cap, size, pos_c, team_c,
-                    list(excl_sets),   # snapshot of confirmed exclusions
-                    unique_by_name,
-                    i + b
-                )
-                futures[future] = i + b
+        if len(results) == 0 and remaining >= MAX_WORKERS:
+            # ── First batch: parallel, all use empty exclusion set ────────────
+            batch_size = MAX_WORKERS
+            futures = {}
+            with ThreadPoolExecutor(max_workers=batch_size) as executor:
+                for b in range(batch_size):
+                    future = executor.submit(
+                        build_and_solve,
+                        players, cap, size, pos_c, team_c,
+                        [],   # no exclusions yet for first batch
+                        unique_by_name,
+                        round_i + b
+                    )
+                    futures[future] = round_i + b
 
-        # Collect results in order
-        batch_results = {}
-        for future in as_completed(futures):
-            idx = futures[future]
-            try:
-                lineup, elapsed = future.result()
-                batch_results[idx] = (lineup, elapsed)
-            except Exception:
-                batch_results[idx] = (None, 0)
+            # Collect in submission order
+            ordered = {}
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    lineup, elapsed = future.result()
+                except Exception:
+                    lineup, elapsed = None, 0
+                ordered[idx] = (lineup, elapsed)
 
-        # Process batch results in order, deduplicating
-        any_found = False
-        for b in range(batch_count):
-            idx = i + b
-            lineup, elapsed = batch_results.get(idx, (None, 0))
+            # Add unique lineups in order, updating excl_sets as we go
+            for b in range(batch_size):
+                idx = round_i + b
+                lineup, elapsed = ordered.get(idx, (None, 0))
+                timings.append(elapsed)
+                if lineup is None:
+                    continue
+                key = lineup_key(lineup, unique_by_name)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    results.append(lineup)
+                    if unique_by_name:
+                        excl_sets.append(set(p["name"] for p in lineup))
+                    else:
+                        excl_sets.append(set(p["uid"] for p in lineup))
+
+            round_i += batch_size
+
+        else:
+            # ── Sequential: each lineup sees all confirmed exclusions ──────────
+            lineup, elapsed = build_and_solve(
+                players, cap, size, pos_c, team_c,
+                excl_sets, unique_by_name, round_i
+            )
             timings.append(elapsed)
+            round_i += 1
 
             if lineup is None:
-                continue
+                break  # no more feasible lineups
 
-            # Deduplicate against already-confirmed results
-            if unique_by_name:
-                key = frozenset(p["name"] for p in lineup)
-            else:
-                key = frozenset(p["uid"] for p in lineup)
-
-            already = any(
-                (frozenset(p["name"] for p in r) if unique_by_name
-                 else frozenset(p["uid"] for p in r)) == key
-                for r in results
-            )
-            if not already:
+            key = lineup_key(lineup, unique_by_name)
+            if key not in seen_keys:
+                seen_keys.add(key)
                 results.append(lineup)
                 if unique_by_name:
                     excl_sets.append(set(p["name"] for p in lineup))
                 else:
                     excl_sets.append(set(p["uid"] for p in lineup))
-                any_found = True
-
-        if not any_found:
-            break  # no new lineups found in this batch — stop
-
-        i += batch_count
+            # if duplicate (shouldn't happen sequentially), just continue
 
     return results, timings
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "solver": "PuLP/CBC (parallel)"})
+    return jsonify({"status": "ok", "solver": "PuLP/CBC (parallel+sequential)"})
 
 
 @app.route("/solve", methods=["POST"])
@@ -192,14 +182,12 @@ def solve():
         n_lineups      = min(int(body.get("n", 5)), 20)
         unique_by_name = bool(body.get("uniqueByName", False))
 
-        # Normalise team constraints
         team_c = {}
         for team, tc in team_c_raw.items():
             val = tc.get("val")
             if val is not None and val != "":
                 team_c[team] = {"val": int(val), "mode": tc.get("mode", "max")}
 
-        # Parse players
         players = []
         for p in players_raw:
             name   = str(p["name"]).strip()
@@ -232,18 +220,10 @@ def solve():
         total_ms = round((time.time() - t0) * 1000)
 
         lineups_out = [
-            [
-                {
-                    "name":   p["name"],
-                    "uid":    p["uid"],
-                    "pos":    p["pos"],
-                    "salary": p["salary"],
-                    "pts":    p["pts"],
-                    "team":   p["team"],
-                    "value":  p["value"],
-                }
-                for p in lineup
-            ]
+            [{"name": p["name"], "uid": p["uid"], "pos": p["pos"],
+              "salary": p["salary"], "pts": p["pts"],
+              "team": p["team"], "value": p["value"]}
+             for p in lineup]
             for lineup in results
         ]
 
@@ -252,7 +232,7 @@ def solve():
             "timings":  timings,
             "totalMs":  total_ms,
             "timedOut": False,
-            "solver":   "PuLP/CBC (parallel)",
+            "solver":   "PuLP/CBC (parallel+sequential)",
         })
 
     except Exception as e:
