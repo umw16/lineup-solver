@@ -14,15 +14,18 @@ app = Flask(__name__)
 CORS(app)  # allow requests from any origin (the browser app)
 
 
-def solve_lineup(players, cap, size, pos_c, team_c, exclude_lineups):
+def solve_lineup(players, cap, size, pos_c, team_c, exclude_lineups, unique_by_name=False):
     """
     Solve one lineup via ILP.
     Returns list of player dicts, or None if infeasible.
+
+    unique_by_name=True  → exclude constraints are name-based (same player in a
+                           different position still counts as a duplicate lineup).
+    unique_by_name=False → exclude constraints are uid-based (original behaviour).
     """
     prob = pulp.LpProblem("lineup", pulp.LpMaximize)
 
     # Binary variable per player-position entry
-    uid_to_player = {p["uid"]: p for p in players}
     x = {p["uid"]: pulp.LpVariable(f"x_{i}", cat="Binary")
          for i, p in enumerate(players)}
 
@@ -56,6 +59,7 @@ def solve_lineup(players, cap, size, pos_c, team_c, exclude_lineups):
             prob += expr <= val
 
     # ── Name uniqueness (same player, multiple positions) ─────────────────────
+    # A player can only appear once in a lineup even if listed under multiple positions.
     names = {}
     for p in players:
         names.setdefault(p["name"], []).append(p)
@@ -64,10 +68,32 @@ def solve_lineup(players, cap, size, pos_c, team_c, exclude_lineups):
             prob += pulp.lpSum(x[p["uid"]] for p in dupes) <= 1
 
     # ── Exclude previous lineups ──────────────────────────────────────────────
-    for excl_uids in exclude_lineups:
-        in_pool = [uid for uid in excl_uids if uid in x]
-        if in_pool:
-            prob += pulp.lpSum(x[uid] for uid in in_pool) <= len(in_pool) - 1
+    # unique_by_name=True:  a "previous lineup" is identified by the SET OF NAMES
+    #   selected. We forbid any new lineup that picks all the same names, regardless
+    #   of which position slot each player fills.
+    #
+    # unique_by_name=False: original uid-based exclusion (name+position must differ).
+    #
+    for excl in exclude_lineups:
+        if unique_by_name:
+            # excl is a set of player NAMES from a previous lineup.
+            # Build the list of all uids in the current pool that belong to those names.
+            # Constraint: you cannot select ALL of those names again.
+            # We enforce: sum of (any uid for name) over excl_names <= |excl_names| - 1
+            terms = []
+            for name in excl:
+                # sum over all positions this name appears in
+                name_uids = [p["uid"] for p in players if p["name"] == name]
+                if name_uids:
+                    # "is this name selected?" = sum of its position variables
+                    terms.append(pulp.lpSum(x[uid] for uid in name_uids))
+            if terms:
+                prob += pulp.lpSum(terms) <= len(excl) - 1
+        else:
+            # Original behaviour: uid-based
+            in_pool = [uid for uid in excl if uid in x]
+            if in_pool:
+                prob += pulp.lpSum(x[uid] for uid in in_pool) <= len(in_pool) - 1
 
     # ── Solve ─────────────────────────────────────────────────────────────────
     prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=30))
@@ -92,12 +118,13 @@ def solve():
         body = request.get_json(force=True)
 
         # ── Parse request ─────────────────────────────────────────────────────
-        players_raw = body.get("players", [])
-        cap         = float(body.get("cap", 100000))
-        size        = int(body.get("size", 9))
-        pos_c       = {str(k): int(v) for k, v in body.get("posC", {}).items()}
-        team_c_raw  = body.get("teamC", {})
-        n_lineups   = min(int(body.get("n", 5)), 20)
+        players_raw    = body.get("players", [])
+        cap            = float(body.get("cap", 100000))
+        size           = int(body.get("size", 9))
+        pos_c          = {str(k): int(v) for k, v in body.get("posC", {}).items()}
+        team_c_raw     = body.get("teamC", {})
+        n_lineups      = min(int(body.get("n", 5)), 20)
+        unique_by_name = bool(body.get("uniqueByName", False))
 
         # Normalise team constraints
         team_c = {}
@@ -135,9 +162,15 @@ def solve():
         timed_out = False
 
         for i in range(n_lineups):
-            excl = [set(p["uid"] for p in lineup) for lineup in results]
-            t1   = time.time()
-            lineup = solve_lineup(players, cap, size, pos_c, team_c, excl)
+            if unique_by_name:
+                # Pass sets of NAMES from each previous lineup
+                excl = [set(p["name"] for p in lineup) for lineup in results]
+            else:
+                # Original: pass sets of UIDs
+                excl = [set(p["uid"] for p in lineup) for lineup in results]
+
+            t1     = time.time()
+            lineup = solve_lineup(players, cap, size, pos_c, team_c, excl, unique_by_name)
             elapsed = (time.time() - t1) * 1000  # ms
             timings.append(round(elapsed))
 
