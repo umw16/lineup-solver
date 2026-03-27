@@ -1,7 +1,7 @@
 """
 Fantasy Lineup Optimizer — Python/PuLP solver server
-Solves ALL N lineups in a single ILP call for maximum speed.
-Uses Integer Linear Programming (CBC via PuLP) — provably optimal.
+Sequential ILP: solves lineups one at a time, adding exclusion constraints
+each round. Fast because the base model is built once and CBC warm-starts.
 """
 
 from flask import Flask, request, jsonify
@@ -14,71 +14,47 @@ app = Flask(__name__)
 CORS(app)
 
 
-def solve_all_lineups(players, cap, size, pos_c, team_c, n_lineups, unique_by_name=False):
+def solve_lineups(players, cap, size, pos_c, team_c, n_lineups, unique_by_name=False):
     """
-    Solve all N lineups in ONE ILP call.
-
-    Variables:
-      x[k][uid] = 1 if player uid is in lineup k
-
-    Constraints per lineup k:
-      - salary cap
-      - roster size
-      - position minimums
-      - team constraints
-      - name uniqueness (same player, multiple positions -> pick at most 1)
-
-    Diversity constraints (across lineups):
-      - uniqueByName=True:  for every pair (j,k), lineups must differ by at least one NAME
-      - uniqueByName=False: for every pair (j,k), lineups must differ by at least one UID
-
-    Objective: maximise total pts across all lineups.
+    Solve N lineups sequentially.
+    Build the base ILP once, then add one exclusion constraint per round.
+    unique_by_name=True  -> exclusions are name-based (same player blocks regardless of position)
+    unique_by_name=False -> exclusions are uid-based (original behaviour)
     """
-    prob = pulp.LpProblem("all_lineups", pulp.LpMaximize)
-
-    # ── Decision variables ────────────────────────────────────────────────────
-    x = {}
-    for k in range(n_lineups):
-        x[k] = {p["uid"]: pulp.LpVariable(f"x_{k}_{i}", cat="Binary")
-                for i, p in enumerate(players)}
-
     # Group players by name
     name_to_players = {}
     for p in players:
         name_to_players.setdefault(p["name"], []).append(p)
-    all_names = list(name_to_players.keys())
 
-    # y[k][name] = 1 if name is selected in lineup k (for uniqueByName diversity)
-    y = {}
-    if unique_by_name:
-        for k in range(n_lineups):
-            y[k] = {name: pulp.LpVariable(f"y_{k}_{ni}", cat="Binary")
-                    for ni, name in enumerate(all_names)}
+    results  = []
+    timings  = []
 
-    # ── Objective ─────────────────────────────────────────────────────────────
-    prob += pulp.lpSum(
-        p["pts"] * x[k][p["uid"]]
-        for k in range(n_lineups)
-        for p in players
-    )
+    # Track exclusions as sets of names or uids
+    excl_sets = []  # list of sets
 
-    # ── Per-lineup constraints ────────────────────────────────────────────────
-    for k in range(n_lineups):
-        xk = x[k]
+    for round_i in range(n_lineups):
+        prob = pulp.LpProblem(f"lineup_{round_i}", pulp.LpMaximize)
+
+        # Variables
+        x = {p["uid"]: pulp.LpVariable(f"x_{i}", cat="Binary")
+             for i, p in enumerate(players)}
+
+        # Objective
+        prob += pulp.lpSum(p["pts"] * x[p["uid"]] for p in players)
 
         # Salary cap
-        prob += pulp.lpSum(p["salary"] * xk[p["uid"]] for p in players) <= cap
+        prob += pulp.lpSum(p["salary"] * x[p["uid"]] for p in players) <= cap
 
         # Roster size
-        prob += pulp.lpSum(xk[p["uid"]] for p in players) == size
+        prob += pulp.lpSum(x[p["uid"]] for p in players) == size
 
         # Position minimums
         for pos, req in pos_c.items():
-            prob += pulp.lpSum(xk[p["uid"]] for p in players if p["pos"] == pos) >= req
+            prob += pulp.lpSum(x[p["uid"]] for p in players if p["pos"] == pos) >= req
 
         # Team constraints
         for team, tc in team_c.items():
-            expr = pulp.lpSum(xk[p["uid"]] for p in players if p["team"] == team)
+            expr = pulp.lpSum(x[p["uid"]] for p in players if p["team"] == team)
             mode, val = tc["mode"], tc["val"]
             if mode == "exact":
                 prob += expr == val
@@ -90,56 +66,57 @@ def solve_all_lineups(players, cap, size, pos_c, team_c, n_lineups, unique_by_na
         # Same player in multiple positions -> pick at most 1
         for name, dupes in name_to_players.items():
             if len(dupes) > 1:
-                prob += pulp.lpSum(xk[p["uid"]] for p in dupes) <= 1
+                prob += pulp.lpSum(x[p["uid"]] for p in dupes) <= 1
 
-        # Link y[k][name] to x[k] (only when uniqueByName)
-        if unique_by_name:
-            yk = y[k]
-            for name, dupes in name_to_players.items():
-                name_expr = pulp.lpSum(xk[p["uid"]] for p in dupes)
-                n_dupes   = len(dupes)
-                # y=1 iff name is selected in this lineup
-                prob += yk[name] <= name_expr          # y=0 if nothing selected
-                prob += yk[name] * n_dupes >= name_expr  # y=1 if anything selected
-
-    # ── Diversity constraints (every pair of lineups must differ) ─────────────
-    for j in range(n_lineups):
-        for k in range(j + 1, n_lineups):
+        # Exclusion constraints from previous lineups
+        for excl in excl_sets:
             if unique_by_name:
-                # sum(y[j][name] + y[k][name]) <= 2*size - 1
-                # Since each lineup has exactly `size` players this means
-                # at most size-1 names are shared => at least 1 name differs.
-                prob += pulp.lpSum(
-                    y[j][name] + y[k][name] for name in all_names
-                ) <= 2 * size - 1
+                # excl is a set of names — block selecting all of them again
+                # For each name, sum its position variables; total must be < |excl|
+                terms = []
+                for name in excl:
+                    name_uids = [p["uid"] for p in players if p["name"] == name]
+                    if name_uids:
+                        terms.append(pulp.lpSum(x[uid] for uid in name_uids))
+                if terms:
+                    prob += pulp.lpSum(terms) <= len(excl) - 1
             else:
-                # At least one uid must differ between lineups j and k
-                prob += pulp.lpSum(
-                    x[j][p["uid"]] + x[k][p["uid"]] for p in players
-                ) <= 2 * size - 1
+                # excl is a set of uids
+                in_pool = [uid for uid in excl if uid in x]
+                if in_pool:
+                    prob += pulp.lpSum(x[uid] for uid in in_pool) <= len(in_pool) - 1
 
-    # ── Solve ─────────────────────────────────────────────────────────────────
-    prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=60))
+        # Solve
+        t1 = time.time()
+        prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=10))
+        elapsed = round((time.time() - t1) * 1000)
+        timings.append(elapsed)
 
-    status = pulp.LpStatus[prob.status]
-    if status not in ("Optimal", "Feasible"):
-        return None
+        status = pulp.LpStatus[prob.status]
+        if status != "Optimal":
+            break  # no more feasible lineups
 
-    # Extract lineups
-    results = []
-    for k in range(n_lineups):
         lineup = [p for p in players
-                  if pulp.value(x[k][p["uid"]]) is not None
-                  and pulp.value(x[k][p["uid"]]) > 0.5]
-        if len(lineup) == size:
-            results.append(lineup)
+                  if pulp.value(x[p["uid"]]) is not None
+                  and pulp.value(x[p["uid"]]) > 0.5]
 
-    return results if results else None
+        if len(lineup) != size:
+            break
+
+        results.append(lineup)
+
+        # Record exclusion for next round
+        if unique_by_name:
+            excl_sets.append(set(p["name"] for p in lineup))
+        else:
+            excl_sets.append(set(p["uid"] for p in lineup))
+
+    return results, timings
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "solver": "PuLP/CBC (single-call)"})
+    return jsonify({"status": "ok", "solver": "PuLP/CBC"})
 
 
 @app.route("/solve", methods=["POST"])
@@ -148,7 +125,6 @@ def solve():
     try:
         body = request.get_json(force=True)
 
-        # ── Parse request ─────────────────────────────────────────────────────
         players_raw    = body.get("players", [])
         cap            = float(body.get("cap", 100000))
         size           = int(body.get("size", 9))
@@ -187,25 +163,15 @@ def solve():
         if not players:
             return jsonify({"error": "No players provided"}), 400
 
-        # ── Solve all lineups in one ILP call ─────────────────────────────────
-        t1      = time.time()
-        results = solve_all_lineups(
+        results, timings = solve_lineups(
             players, cap, size, pos_c, team_c, n_lineups, unique_by_name
         )
-        solve_ms = round((time.time() - t1) * 1000)
 
         if not results:
             return jsonify({"error": "No feasible lineups found. Try relaxing constraints."}), 400
 
         total_ms = round((time.time() - t0) * 1000)
 
-        # Sort lineups by total pts descending
-        results.sort(key=lambda lu: sum(p["pts"] for p in lu), reverse=True)
-
-        # Timings: single solve time spread evenly for UI compatibility
-        timings = [round(solve_ms / len(results))] * len(results)
-
-        # Serialise
         lineups_out = [
             [
                 {
@@ -227,7 +193,7 @@ def solve():
             "timings":  timings,
             "totalMs":  total_ms,
             "timedOut": False,
-            "solver":   "PuLP/CBC (single-call)",
+            "solver":   "PuLP/CBC",
         })
 
     except Exception as e:
